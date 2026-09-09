@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Rosetta is installed
+        run: softwareupdate --install-rosetta --agree-to-license
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Probe the installed Rosetta
+        # Locates every anchor this build hooks in the runner's Rosetta and
+        # validates the assumptions behind them; exits non-zero if any is off.
+        run: build/bin/x87sidecar --probe
+
+      - name: Run tests
+        # PT_ATTACH on macOS needs either the debugger entitlement (granted
+        # via an interactive system dialog on first launch — not available
+        # in headless CI, would hang the job) or root.  GitHub's macos-26
+        # runners give passwordless sudo, so just use that.
+        run: sudo scripts/run_tests.sh --no-build

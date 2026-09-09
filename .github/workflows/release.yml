@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on master
+        run: |
+          git fetch origin master --depth=1 || true
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not point at a commit on master"
+            exit 1
+          fi
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build x87sidecar
+        # Builds both signed artifacts: x87sidecar (flat, no entitlements) and
+        # x87sidecar_entitled (cs.debugger + get-task-allow), via POST_BUILD.
+        run: cmake --build build --target x87sidecar --parallel
+
+      - name: Package artifacts
+        run: |
+          tar --xz -cf x87sidecar.tar.xz -C build/bin x87sidecar
+          tar --xz -cf x87sidecar_entitled.tar.xz -C build/bin x87sidecar_entitled
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: x87sidecar ${{ github.ref_name }}
+          draft: true
+          files: |
+            x87sidecar.tar.xz
+            x87sidecar_entitled.tar.xz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
