@@ -372,3 +372,7 @@ Loader and sidecar diagnostics:
 ## License
 
 MIT.
+
+## Support
+
+This build is part of the free, open AoE IV pack for Apple Silicon; see [`DONATE.md`](DONATE.md).
