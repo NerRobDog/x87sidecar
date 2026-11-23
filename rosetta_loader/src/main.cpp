@@ -2213,8 +2213,12 @@ int main(int argc, char* argv[]) try {
             const char* blocked = (cooperative && !libOneSlot) ? "cooperative mode: no i-cache slot for the runtime patch" : nullptr;
             const auto r = reclaim_cap::install(acc, runtimeBase, blocked, &reclaimIcache);
             if (r == reclaim_cap::Result::Fatal) {
-                // A Rosetta runtime page stayed non-executable: resuming would crash the game at a random point.
-                fprintf(stdout, "[rosettax87] reclaim patch left a runtime page non-executable; not resuming the process\n");
+                // A Rosetta runtime page stayed non-executable. Resuming would crash the game at a random point
+                // later (exiting alone also resumes it: the dead reply right unblocks the handshake). Stop it now,
+                // with one clear line, so the launcher sees a failed start instead.
+                fprintf(stdout, "[rosettax87] reclaim patch left a runtime page non-executable; stopping the process (start it again, or set AOE2_NO_F54A=1)\n");
+                fflush(stdout);
+                kill(parentPid, SIGKILL);
                 return 1;
             }
             reclaimInstalled = r == reclaim_cap::Result::Installed && reclaimIcache.len != 0;
