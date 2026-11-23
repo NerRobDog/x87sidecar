@@ -1045,11 +1045,19 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t 
 }
 
 
+static StubBlobs buildDefaultDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+                                        const uint8_t origPrologue16[16], uint16_t hostArplOpcode);
+
 // Experimental, opt-in invalid-opcode lowering for a bounded guest text range.
+// softFault=false (substitution only, no AOE_SOFTFAULT_*): the translation-time
+// substitutions below run first; when none applies, the handler chains to the
+// default decode hook (DC D8 / ARPL), built right behind it, so stock behaviour
+// is unchanged.
 // The original guest bytes are never written. Decoder calls at other PCs,
 // valid instructions, legacy mode, and mismatched bytes retain stock behavior.
 static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
-                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0) {
+                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0,
+                                    bool softFault=true, uint16_t hostArplOpcode=0) {
     StubBlobs b;
     if ((handlerAddr | decodeOpcodeAddr | pc | target) & 0xffff000000000000ULL) return b;
     const int64_t displacement = static_cast<int64_t>(target) - static_cast<int64_t>(pc + 2);
@@ -1209,6 +1217,19 @@ static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeA
         label("nosubst");
         ins(ldp_offset(0,1,SP,0));ins(ldp_offset(2,3,SP,16));
     }
+    if(!softFault){
+        // No substitution applied: drop our frame (x0..x3 are already restored) and continue in the default handler.
+        ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));branch("dflt",0);
+        label("done");ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));ins(RET_INSN);
+        label("stock");h.insert(h.end(),orig,orig+16);emit_abs_jump_3movs(h,decodeOpcodeAddr+16);
+        while(h.size()%4)h.push_back(0);
+        label("dflt");
+        for(const auto& f:fixes){const int offset=static_cast<int>((static_cast<int64_t>(labels.at(f.label))-static_cast<int64_t>(f.pos))/4);patch_word(h,f.pos,f.kind==1?bl(offset):f.kind==0?b_uncond(offset):b_cond(f.cond,offset));}
+        const StubBlobs d=buildDefaultDecodeHook(handlerAddr+h.size(),decodeOpcodeAddr,orig,hostArplOpcode);
+        if(d.entry.size()!=16||d.handler.empty())return {};
+        h.insert(h.end(),d.handler.begin(),d.handler.end());
+        emit_abs_jump_3movs(b.entry,handlerAddr);return b;
+    }
     branch("stock",1);
     ins(cmp_imm_w(0,1));branch("done",2,COND_NE);
     ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("done",2,COND_NE);
@@ -1260,6 +1281,16 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
         if(softEnd||softOne){if(!softEnd||!softOne)return {};char *a=nullptr,*b=nullptr;end=std::strtoull(softEnd,&a,0);one=std::strtoull(softOne,&b,0);if(!end||!one||*a||*b)return {};}
         return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,pc,target,end,one);
     }
+    // Translation-time substitution works on its own: with AOE_SUBST_LIST (or all of AOE_SUBST_PC/ORIG/NEW) and no
+    // soft-fault variables, the substitution block runs in front of the default hook.
+    const char* sl=std::getenv("AOE_SUBST_LIST");
+    if((sl&&*sl)||(std::getenv("AOE_SUBST_PC")&&std::getenv("AOE_SUBST_ORIG")&&std::getenv("AOE_SUBST_NEW")))
+        return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,0,0,0,0,false,hostArplOpcode);
+    return buildDefaultDecodeHook(handlerAddr,decodeOpcodeAddr,origPrologue16,hostArplOpcode);
+}
+
+static StubBlobs buildDefaultDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+                                        const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
     StubBlobs blobs;
 
     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
