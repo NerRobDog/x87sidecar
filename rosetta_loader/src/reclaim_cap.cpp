@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -168,17 +169,18 @@ RcState rc;
 // Exactness: no fragment is freed earlier than stock would free it (only the timing of freeing moves later); no guest
 // instruction, register or memory changes. Exact-bytes gated; off unless the variable is set.
 constexpr uint64_t kOffLwPad2 = kOffTextPad + 0x1c00;   // stub area in the text padding (same address as build 827ba3e7)
-bool installImpl(const Access& acc, uint64_t rt) {
+Result installImpl(const Access& acc, uint64_t rt, const char* blocked, IcacheRange* icache) {
     const char* kv = std::getenv("AOE_RECLAIM_CAP");
     const char* bv = std::getenv("AOE_RECLAIM_BUDGET_US");   // F54a-2: time budget per pass (µs), checked every 64 fragments
     uint64_t K = 0, budgetUs = 0;
     if (kv && (!parseU64(kv, K) || K > 4095)) K = 0;
     if (bv && (!parseU64(bv, budgetUs) || budgetUs > 100000)) budgetUs = 0;
-    if (K == 0 && budgetUs == 0) return false;
+    if (K == 0 && budgetUs == 0) return Result::Off;
     const uint64_t budgetTicks = budgetUs * 24;              // CNTVCT 24 MHz
     FILE* lg = stdout;
     if (const char* rp = std::getenv("AOE_RECLAIM_LOG")) if (*rp) if (FILE* f = fopen(rp, "a")) lg = f;   // install proof for the launcher
-    auto refuse = [&](const char* why) { fprintf(lg, "[reclaimcap] not installed: %s\n", why); fflush(lg); return false; };
+    auto refuse = [&](const char* why) { fprintf(lg, "[reclaimcap] not installed: %s\n", why); fflush(lg); return Result::Refused; };
+    if (blocked) return refuse(blocked);
     // Sites: exact fingerprint -> the fixed offsets (fast path), and the pattern locator must agree; otherwise the locator
     // alone (reclaim_locate.hpp: structural signatures + cross-checks; any doubt -> refuse = stock behaviour).
     bool fp = true;
@@ -366,13 +368,22 @@ bool installImpl(const Access& acc, uint64_t rt) {
     std::vector<uint8_t> probe(s.w.size() * 4);
     if (!acc.read(rt + padAt, probe.data(), probe.size())) return refuse("cannot read the text padding");
     for (uint8_t b : probe) if (b != 0) return refuse("text padding is in use");
+    // The stubs store to the __DATA tail: it must be live and writable, or nothing is patched (the zero tail in the
+    // file says nothing about the live mapping).
     const uint64_t z[6] = {0, 0, 0, 0, 0, 0};
-    acc.write(st + kStRcCount, z, 48);
-    auto patchCode = [&](uint64_t addr, const void* bytes, size_t len) {
-        return acc.protect(addr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, len) && acc.write(addr, bytes, len) &&
-               acc.protect(addr, VM_PROT_READ | VM_PROT_EXECUTE, len);
-    };
-    if (!patchCode(rt + padAt, s.w.data(), s.w.size() * 4)) return refuse("cannot write the stubs");
+    if (!acc.write(st + kStRcCount, z, 48)) return refuse("cannot write the state in the __DATA tail (nothing patched)");
+    { uint64_t back[6] = {1, 1, 1, 1, 1, 1};
+      if (!acc.read(st + kStRcCount, back, 48) || memcmp(back, z, 48)) return refuse("state in the __DATA tail does not read back (nothing patched)"); }
+    // Stubs into the zero padding. Its page may also hold live code (on another build), so it must be r-x again
+    // afterwards: one retry, else Fatal (the caller must not resume the process with that page non-executable).
+    if (!acc.protect(rt + padAt, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, s.w.size() * 4)) return refuse("cannot make the text padding writable");
+    const bool stubsWritten = acc.write(rt + padAt, s.w.data(), s.w.size() * 4);
+    if (!acc.protect(rt + padAt, VM_PROT_READ | VM_PROT_EXECUTE, s.w.size() * 4) &&
+        !acc.protect(rt + padAt, VM_PROT_READ | VM_PROT_EXECUTE, s.w.size() * 4)) {
+        fprintf(lg, "[reclaimcap] FATAL: cannot restore r-x on the text padding\n"); fflush(lg);
+        return Result::Fatal;
+    }
+    if (!stubsWritten) return refuse("cannot write the stubs");
     const uint32_t blReset = blWord(rt + L.resetCall, resetStub);
     const uint32_t bCap = 0x14000000U | (static_cast<uint32_t>((static_cast<int64_t>(capStub) - static_cast<int64_t>(rt + L.backEdge)) >> 2) & 0x03ffffffU);
     const uint32_t blGrow = blWord(rt + L.growCall, growStub);
@@ -385,25 +396,50 @@ bool installImpl(const Access& acc, uint64_t rt) {
     for (; prot < 3; prot++)
         if (!acc.protect(rt + sites[prot].off, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, 4)) break;
     if (prot < 3) {
-        for (int i = 0; i < prot; i++) acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4);
+        bool rxBack = true;
+        for (int i = 0; i < prot; i++) rxBack &= acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4) ||
+                                                   acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4);
+        if (!rxBack) { fprintf(lg, "[reclaimcap] FATAL: cannot restore r-x on a runtime page\n"); fflush(lg); return Result::Fatal; }
         return refuse("cannot make a site writable (nothing patched)");
     }
     int wrote = 0;
     for (; wrote < 3; wrote++)
         if (!acc.write(rt + sites[wrote].off, &sites[wrote].word, 4)) break;
+    bool rolledBack = true;
     if (wrote < 3)
-        for (int i = wrote - 1; i >= 0; i--) acc.write(rt + sites[i].off, &sites[i].orig, 4);
-    for (int i = 0; i < 3; i++) acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4);
-    if (wrote < 3) return refuse("cannot write a site (rolled back to stock)");
+        for (int i = wrote - 1; i >= 0; i--) rolledBack &= acc.write(rt + sites[i].off, &sites[i].orig, 4);
+    // Every site page must be executable again before the tracee runs. One retry per site; if a page stays
+    // non-executable the process cannot continue safely, so the caller is told (Result::Fatal) instead of "installed".
+    bool rx = true;
+    for (int i = 0; i < 3; i++)
+        if (!acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4) &&
+            !acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4)) rx = false;
+    if (!rx) {
+        // Roll back to stock (writable again, original words), then try r-x once more on every site. Only if a page
+        // still can't be made executable is it Fatal.
+        for (int i = 2; i >= 0; i--)
+            if (acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY, 4)) acc.write(rt + sites[i].off, &sites[i].orig, 4);
+        bool rxAgain = true;
+        for (int i = 0; i < 3; i++) rxAgain &= acc.protect(rt + sites[i].off, VM_PROT_READ | VM_PROT_EXECUTE, 4);
+        if (rxAgain) return refuse("cannot restore r-x on a site (rolled back to stock)");
+        fprintf(lg, "[reclaimcap] FATAL: cannot restore r-x on a patched runtime page\n"); fflush(lg);
+        return Result::Fatal;
+    }
+    if (wrote < 3) return refuse(rolledBack ? "cannot write a site (rolled back to stock)" : "cannot write a site and the rollback failed");
+    if (icache) {   // what the tracee must i-cache-invalidate (cooperative mode): the three sites and the stubs
+        uint64_t lo = std::min({L.growCall, L.resetCall, L.backEdge, padAt}), hi = std::max({L.growCall, L.resetCall, L.backEdge}) + 4;
+        hi = std::max(hi, padAt + s.w.size() * 4);
+        icache->addr = rt + lo; icache->len = hi - lo;
+    }
     rc.on = true; rc.rt = rt; rc.st = rt + L.stateLo; rc.K = K; rc.budgetUs = budgetUs;
     fprintf(lg, "[reclaimcap] installed: K=%llu budget_us=%llu, stubs 0x%llx (%zu bytes)\n", (unsigned long long)K, (unsigned long long)budgetUs,
             (unsigned long long)(rt + kOffLwPad2), s.w.size() * 4);
     fflush(lg);
-    return true;
+    return Result::Installed;
 }
 
 }  // namespace
 
-bool install(const Access& acc, uint64_t rt) { return installImpl(acc, rt); }
+Result install(const Access& acc, uint64_t rt, const char* blocked, IcacheRange* icache) { return installImpl(acc, rt, blocked, icache); }
 
 }  // namespace reclaim_cap

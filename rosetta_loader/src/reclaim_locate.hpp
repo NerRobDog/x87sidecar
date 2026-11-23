@@ -99,6 +99,36 @@ struct Dec {
     static bool isSubSpImm(uint32_t x) { return (x & 0xFFC003FFU) == 0xD10003FFU; }
     static bool isStpPre(uint32_t x) { return (x & 0xFFC003E0U) == 0xA98003E0U; }   // stp x?, x?, [sp, #-n]!
     static bool isRet(uint32_t x) { return x == 0xD65F03C0U; }
+    // Does x name x16/x17 (w16/w17) in any general-register operand? Decoded by encoding class so immediates and
+    // branch offsets don't count; when a class is unclear every plausible register field counts (fail-closed).
+    static bool namesIp(uint32_t x) {
+        auto ip = [](uint32_t r) { return r == 16 || r == 17; };
+        const uint32_t r0 = x & 31, r5 = (x >> 5) & 31, r10 = (x >> 10) & 31, r16 = (x >> 16) & 31;
+        const uint32_t op0 = (x >> 25) & 0xF;
+        if ((op0 & 0xE) == 0x8) {                                    // data processing, immediate
+            if (((x >> 23) & 0x3F) == 0x25 || ((x >> 24) & 0x1F) == 0x10) return ip(r0);   // movz/movn/movk, adr/adrp
+            return ip(r0) || ip(r5);
+        }
+        if ((op0 & 0xE) == 0xA) {                                    // branches, exception, system
+            if ((x & 0x7C000000U) == 0x14000000U) return false;     // b / bl (imm26)
+            if ((x & 0xFE000000U) == 0x54000000U) return false;     // b.cond
+            if ((x & 0x7E000000U) == 0x34000000U || (x & 0x7E000000U) == 0x36000000U) return ip(r0);  // cbz/cbnz/tbz/tbnz
+            if ((x & 0xFE000000U) == 0xD6000000U) return ip(r5) || ip(r0);   // br/blr/ret (+ pac forms)
+            if ((x & 0xFFC00000U) == 0xD5000000U) return ip(r0);     // system (mrs/msr/hint/barriers)
+            return ip(r0) || ip(r5);                                 // svc/brk etc.: be conservative
+        }
+        if ((op0 & 0x5) == 0x4) {                                    // loads and stores
+            if (((x >> 24) & 0x3B) == 0x39) return ip(r0) || ip(r5);                 // unsigned-offset form
+            if (((x >> 27) & 0x7) == 0x5) return ip(r0) || ip(r5) || ip(r10);        // pairs
+            if (((x >> 24) & 0x3B) == 0x18) return ip(r0);                           // literal
+            return ip(r0) || ip(r5) || ip(r16);                                      // reg offset, atomics, exclusives
+        }
+        if ((op0 & 0x7) == 0x5) {                                    // data processing, register
+            if (((x >> 24) & 0x1F) == 0x1B) return ip(r0) || ip(r5) || ip(r16) || ip(r10);   // 3-source (madd, …)
+            return ip(r0) || ip(r5) || ip(r16);
+        }
+        return ip(r0) || ip(r5) || ip(r16) || ip(r10);               // SIMD/FP and anything else
+    }
     static bool isAddW7(uint32_t x, uint32_t r) { return x == (0x11001C00U | (r << 5) | r); }               // add wR, wR, #7
     static bool isAndNot7(uint32_t x, uint32_t d, uint32_t n) { return x == (0x121D7000U | (n << 5) | d); }  // and wD, wN, #~7
     static bool isCasaW(uint32_t x) { return (x & 0xFFE0FC00U) == 0x88E07C00U; }
@@ -149,6 +179,13 @@ inline bool locate(const Image& im, Sites& s, std::string& why) {
       if (!Dec::isAdrp(e0) || !Dec::isStrX(e1) || Dec::rn(e1) != Dec::rd(e0) || Dec::rd(e1) != xa) return fail("exit does not keep the rest");
       s.freeListHead = Dec::adrpTarget(s.exitKeep, e0) + Dec::ldstOffX(e1); }
     if (s.freeListHead < im.dataLo || s.freeListHead >= im.dataHi) return fail("free-list head not in __DATA");
+    // 3b) the cap stub (at the back-edge, and on its way to the exit) overwrites x16/x17. Neither the fragment registers
+    //     nor anything else in the loop or the exit block may hold a live value there. Conservative: refuse if any
+    //     register field of any word from the loop head to the end of the exit block names x16/x17 (the 27.2 runtime
+    //     uses neither anywhere in the reclaim function). A false hit only means fail-closed (stock reclaim).
+    if (xa == 16 || xa == 17 || xc == 16 || xc == 17) return fail("loop keeps a fragment in x16/x17 (the stub clobbers them)");
+    for (uint64_t a = s.loopHead; a < s.exitKeep + 0x40; a += 4)
+        if (Dec::namesIp(d.w(a))) return fail("reclaim loop or exit names x16/x17 (the stub clobbers them)");
     // 4) reclaim function entry: nearest "sub sp, sp, #imm" above the loop head, preceded by the end of another function
     for (uint64_t a = s.loopHead; a >= im.textLo && s.loopHead - a < 0x400; a -= 4)
         if (Dec::isSubSpImm(d.w(a))) { s.reclaimFn = a; break; }

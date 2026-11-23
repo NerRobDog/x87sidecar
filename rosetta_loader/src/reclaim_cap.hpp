@@ -10,5 +10,9 @@ struct Access {
     std::function<bool(uint64_t, const void*, size_t)> write;
     std::function<bool(uint64_t, vm_prot_t, size_t)> protect;
 };
-bool install(const Access& acc, uint64_t runtimeBase);
+enum class Result { Off, Refused, Installed, Fatal };   // Fatal: a runtime page could not be made r-x again
+struct IcacheRange { uint64_t addr = 0, len = 0; };     // code the tracee must i-cache-invalidate after Installed
+// blocked != nullptr: refuse with that reason (logged) when the feature is requested. icache (optional) receives the
+// patched range on Installed.
+Result install(const Access& acc, uint64_t runtimeBase, const char* blocked = nullptr, IcacheRange* icache = nullptr);
 }

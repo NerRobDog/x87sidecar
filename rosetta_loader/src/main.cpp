@@ -2193,6 +2193,16 @@ int main(int argc, char* argv[]) try {
 
         // F54a: bounded reclaim in Rosetta's runtime (AOE_RECLAIM_BUDGET_US). Off without the variable; fails closed
         // (stock reclaim) on any runtime build it cannot verify. Never fails the attach.
+        // In cooperative mode the tracee must i-cache-invalidate the reclaim patch itself (a cross-process flush is
+        // not reliable, see coop_proto.h), but the reply has only two slots. The libRosettaRuntime ranges (entry
+        // patches + handler padding) all lie in the one executable region found above, so they fit one slot and
+        // the reclaim patch takes the other. If they don't (unexpected layout), the reclaim patch is not installed.
+        const uint64_t libLo = decodeEntryAddr != 0 ? std::min(translateInsnAddr, decodeEntryAddr) : translateInsnAddr;
+        const uint64_t libHi = decodeBlobEnd;
+        const bool libOneSlot = libLo >= codeRegStart && libHi <= codeRegEnd && libLo < libHi &&
+                                padStartAddr >= libLo && translateInsnAddr + blobs.entry.size() <= libHi;
+        reclaim_cap::IcacheRange reclaimIcache;
+        bool reclaimInstalled = false;
         {
             reclaim_cap::Access acc;
             acc.read = [&](uint64_t addr, void* dst, size_t len) { return dbg.readMemory(addr, dst, len); };
@@ -2200,7 +2210,14 @@ int main(int argc, char* argv[]) try {
             acc.protect = [&](uint64_t addr, vm_prot_t prot, size_t len) {
                 return dbg.adjustMemoryProtection(addr, prot, len);
             };
-            (void)reclaim_cap::install(acc, runtimeBase);
+            const char* blocked = (cooperative && !libOneSlot) ? "cooperative mode: no i-cache slot for the runtime patch" : nullptr;
+            const auto r = reclaim_cap::install(acc, runtimeBase, blocked, &reclaimIcache);
+            if (r == reclaim_cap::Result::Fatal) {
+                // A Rosetta runtime page stayed non-executable: resuming would crash the game at a random point.
+                fprintf(stdout, "[rosettax87] reclaim patch left a runtime page non-executable; not resuming the process\n");
+                return 1;
+            }
+            reclaimInstalled = r == reclaim_cap::Result::Installed && reclaimIcache.len != 0;
         }
 
         // Record the patched code ranges so the tracee can invalidate its own
@@ -2226,6 +2243,12 @@ int main(int argc, char* argv[]) try {
         }
         coopIcacheAddr[1] = padStartAddr;
         coopIcacheLen[1] = decodeBlobEnd - padStartAddr;
+        if (reclaimInstalled) {   // slot 0: all libRosettaRuntime patches (one region); slot 1: the reclaim patch
+            coopIcacheAddr[0] = libLo;
+            coopIcacheLen[0] = libHi - libLo;
+            coopIcacheAddr[1] = reclaimIcache.addr;
+            coopIcacheLen[1] = reclaimIcache.len;
+        }
 
         // Capture the tracee's task port BEFORE releasing it. The send-right is
         // held in MuhDebugger::taskPort_ and stays valid past release (default's
