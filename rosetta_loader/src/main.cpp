@@ -45,6 +45,7 @@
 #include "rosetta_core/TranscendentalHelper.h"
 #include "rosetta_core/TranslationResult.h"
 #include "sidecar.hpp"
+#include "subst_count.hpp"
 #include "stub_asm.hpp"
 #include "types.h"
 
@@ -2148,6 +2149,7 @@ int main(int argc, char* argv[]) try {
             // bytes, all in the pad. Nothing it touches lives outside the
             // runtime's own image, which is what makes it survive wine's forks.
             const uint64_t decodeHandlerAddr = (constsEnd + 0x3) & ~static_cast<uint64_t>(0x3);
+            (void)subst_count::allocate(dbg.taskPort());   // applied-counters for the substitutions (no-op without one)
             stub_asm::StubBlobs dblobs;
             if (!dbg.readMemory(decodeOpcodeAddr, origDecodePrologue,
                                 sizeof(origDecodePrologue))) {
@@ -2233,6 +2235,7 @@ int main(int argc, char* argv[]) try {
         // Env wins over the flags: an app bundle can set variables but not argv.
         sidecar::samplerConfigFromEnv(samplerCfg);
         sidecar::startSampler(parentTaskPort, runtimeBase, samplerCfg);
+        subst_count::start(parentTaskPort);
         installSamplerExitSignals(samplerCfg);
         VERBOSE_LOG("M2: receive thread running; entering kqueue wait\n");
 

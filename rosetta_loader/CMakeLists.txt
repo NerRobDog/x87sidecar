@@ -34,6 +34,7 @@ add_executable(x87sidecar
     src/offset_finder.cpp
     src/sidecar.cpp
     src/stub_asm.cpp
+    src/subst_count.cpp
     ${MACH_EXC_SERVER}
 )
 
