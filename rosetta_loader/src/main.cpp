@@ -34,6 +34,7 @@
 #include "guest_pc_map.hpp"
 #include "mach_exception.hpp"
 #include "offset_finder.hpp"
+#include "reclaim_cap.hpp"
 #include "rosetta_core/Config.h"
 #include "rosetta_core/ConfigEnv.h"
 #include "rosetta_core/CoreConfig.h"
@@ -2188,6 +2189,18 @@ int main(int argc, char* argv[]) try {
                 VERBOSE_LOG("M2: decode_opcode entry patched (abs-jump to 0x%llx, handler %zu B)\n",
                             decodeHandlerAddr, dblobs.handler.size());
             }
+        }
+
+        // F54a: bounded reclaim in Rosetta's runtime (AOE_RECLAIM_BUDGET_US). Off without the variable; fails closed
+        // (stock reclaim) on any runtime build it cannot verify. Never fails the attach.
+        {
+            reclaim_cap::Access acc;
+            acc.read = [&](uint64_t addr, void* dst, size_t len) { return dbg.readMemory(addr, dst, len); };
+            acc.write = [&](uint64_t addr, const void* src, size_t len) { return dbg.writeMemory(addr, src, len); };
+            acc.protect = [&](uint64_t addr, vm_prot_t prot, size_t len) {
+                return dbg.adjustMemoryProtection(addr, prot, len);
+            };
+            (void)reclaim_cap::install(acc, runtimeBase);
         }
 
         // Record the patched code ranges so the tracee can invalidate its own
