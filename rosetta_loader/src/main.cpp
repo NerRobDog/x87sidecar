@@ -2216,7 +2216,7 @@ int main(int argc, char* argv[]) try {
                 // A Rosetta runtime page stayed non-executable. Resuming would crash the game at a random point
                 // later (exiting alone also resumes it: the dead reply right unblocks the handshake). Stop it now,
                 // with one clear line, so the launcher sees a failed start instead.
-                fprintf(stdout, "[rosettax87] reclaim patch left a runtime page non-executable; stopping the process (start it again, or set AOE2_NO_F54A=1)\n");
+                fprintf(stdout, "[rosettax87] reclaim patch left a runtime page non-executable; stopping the process (start it again, or unset AOE_RECLAIM_BUDGET_US)\n");
                 fflush(stdout);
                 kill(parentPid, SIGKILL);
                 return 1;
