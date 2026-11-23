@@ -1,6 +1,8 @@
 #include "stub_asm.hpp"
+#include "subst_count.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -1043,11 +1045,19 @@ StubBlobs build(uint64_t handlerAddr, uint64_t translateInsnAddr, const uint8_t 
 }
 
 
+static StubBlobs buildDefaultDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+                                        const uint8_t origPrologue16[16], uint16_t hostArplOpcode);
+
 // Experimental, opt-in invalid-opcode lowering for a bounded guest text range.
+// softFault=false (substitution only, no AOE_SOFTFAULT_*): the translation-time
+// substitutions below run first; when none applies, the handler chains to the
+// default decode hook (DC D8 / ARPL), built right behind it, so stock behaviour
+// is unchanged.
 // The original guest bytes are never written. Decoder calls at other PCs,
 // valid instructions, legacy mode, and mismatched bytes retain stock behavior.
 static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
-                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0) {
+                                    const uint8_t orig[16], uint64_t pc, uint64_t target, uint64_t end=0, uint64_t target1=0,
+                                    bool softFault=true, uint16_t hostArplOpcode=0) {
     StubBlobs b;
     if ((handlerAddr | decodeOpcodeAddr | pc | target) & 0xffff000000000000ULL) return b;
     const int64_t displacement = static_cast<int64_t>(target) - static_cast<int64_t>(pc + 2);
@@ -1062,8 +1072,164 @@ static StubBlobs buildSoftFaultHook(uint64_t handlerAddr, uint64_t decodeOpcodeA
     auto label=[&](const char* n){labels[n]=h.size();};
     auto branch=[&](const char* n,int kind,unsigned cond=0){fixes.push_back({h.size(),n,kind,cond});ins(0);};
     auto constant=[&](unsigned reg,uint64_t value){ins(movz(reg,value&0xffff,0));ins(movk(reg,(value>>16)&0xffff,16));ins(movk(reg,(value>>32)&0xffff,32));};
+    // AOE_SUBST_PC / AOE_SUBST_ORIG / AOE_SUBST_NEW (hex strings of equal length, <= 255 bytes):
+    // translation-time substitution. While the guest bytes at [PC, PC+N) equal ORIG, the decoder
+    // is shown NEW for every instruction it decodes inside that range. Guest memory is never
+    // written; on any mismatch the stock bytes are decoded.
+    std::vector<uint8_t> substOrig,substNew; uint64_t substPC=0;
+    {
+        const char *sp=std::getenv("AOE_SUBST_PC"),*so=std::getenv("AOE_SUBST_ORIG"),*sn=std::getenv("AOE_SUBST_NEW");
+        auto unhex=[](const char* t,std::vector<uint8_t>& out){
+            auto nib=[](char c)->int{return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;};
+            for(;t[0]&&t[1];t+=2){int a=nib(t[0]),b2=nib(t[1]);if(a<0||b2<0){out.clear();return;}out.push_back(uint8_t(a<<4|b2));}
+            if(t[0])out.clear();};
+        if(sp&&so&&sn){
+            char* e=nullptr;substPC=std::strtoull(sp,&e,0);unhex(so,substOrig);unhex(sn,substNew);
+            if(!substPC||*e||substOrig.empty()||substOrig.size()!=substNew.size()||substOrig.size()>255||(substPC&0xffff000000000000ULL)){substPC=0;substOrig.clear();substNew.clear();}
+        }
+    }
+    // AOE_SUBST_LIST="pc:orig:new[,pc:orig:new...]" (hex, each pair of equal length <= 255,
+    // at most 16 entries, 4 KB of bytes in all): several translation-time substitutions with
+    // the same rule as the single one above, checked per entry. When the list is set, the
+    // single-entry variables (if also set) become its first entry and the list code below is
+    // emitted instead of the single-entry code; without AOE_SUBST_LIST the emitted hook is the
+    // same as before. A malformed list disables every substitution of this start.
+    struct SubstEntry { uint64_t pc; std::vector<uint8_t> orig, neu; };
+    std::vector<SubstEntry> substList;
+    if(const char* sl=std::getenv("AOE_SUBST_LIST"); sl&&*sl){
+        auto unhex=[](const std::string& t,std::vector<uint8_t>& out)->bool{
+            auto nib=[](char c)->int{return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;};
+            if(t.empty()||t.size()%2)return false;
+            for(size_t i=0;i<t.size();i+=2){int a=nib(t[i]),b2=nib(t[i+1]);if(a<0||b2<0)return false;out.push_back(uint8_t(a<<4|b2));}
+            return true;};
+        bool ok=true; size_t total=0; std::string all(sl);
+        if(!substOrig.empty()) substList.push_back({substPC,substOrig,substNew});
+        for(size_t pos=0;ok&&pos<=all.size();){
+            size_t e=all.find_first_of(",;",pos); if(e==std::string::npos)e=all.size();
+            std::string item=all.substr(pos,e-pos); pos=e+1;
+            if(item.empty()){if(e==all.size())break; continue;}
+            size_t c1=item.find(':'),c2=c1==std::string::npos?c1:item.find(':',c1+1);
+            if(c2==std::string::npos||item.find(':',c2+1)!=std::string::npos){ok=false;break;}
+            SubstEntry en; char* ep=nullptr; std::string pcs=item.substr(0,c1);
+            en.pc=std::strtoull(pcs.c_str(),&ep,0);
+            if(!en.pc||*ep||(en.pc&0xffff000000000000ULL)||!unhex(item.substr(c1+1,c2-c1-1),en.orig)||!unhex(item.substr(c2+1),en.neu)
+               ||en.orig.size()!=en.neu.size()||en.orig.size()>255){ok=false;break;}
+            substList.push_back(std::move(en));
+            if(e==all.size())break;
+        }
+        for(auto& en:substList)total+=2*((en.orig.size()+3)&~size_t(3));
+        if(!ok||substList.size()>16||total>4096){
+            fprintf(stdout,"M2: AOE_SUBST_LIST malformed or too large: no substitution in this start\n");
+            substList.clear();
+        }
+        if(ok&&substList.empty())fprintf(stdout,"M2: AOE_SUBST_LIST empty\n");
+        substPC=0;substOrig.clear();substNew.clear();   // single-entry code off when the list is set
+        if(!substList.empty())fprintf(stdout,"M2: translation substitution list: %zu entries\n",substList.size());
+    }
+    const size_t substN=substOrig.size(),substPad=(substN+3)&~size_t(3);
+    const uint64_t substOrigAddr=handlerAddr+4,substNewAddr=substOrigAddr+substPad;
+    if(substN){
+        ins(b_uncond(static_cast<int>(1+2*substPad/4)));
+        h.insert(h.end(),substOrig.begin(),substOrig.end());h.resize(4+substPad,0);
+        h.insert(h.end(),substNew.begin(),substNew.end());h.resize(4+2*substPad,0);
+    }
+    std::vector<uint64_t> listOrigAddr,listNewAddr;
+    if(!substList.empty()){
+        size_t dataBytes=0; for(auto& en:substList)dataBytes+=2*((en.orig.size()+3)&~size_t(3));
+        ins(b_uncond(static_cast<int>(1+dataBytes/4)));
+        for(auto& en:substList){
+            const size_t pad=(en.orig.size()+3)&~size_t(3);
+            listOrigAddr.push_back(handlerAddr+h.size());
+            h.insert(h.end(),en.orig.begin(),en.orig.end());h.resize(h.size()+pad-en.orig.size(),0);
+            listNewAddr.push_back(handlerAddr+h.size());
+            h.insert(h.end(),en.neu.begin(),en.neu.end());h.resize(h.size()+pad-en.neu.size(),0);
+        }
+    }
     ins(sub_imm_x(SP,SP,96));
     ins(stp_offset(0,1,SP,0));ins(stp_offset(2,3,SP,16));ins(str_x_offset(LR,SP,32));
+    const uint64_t cnt=subst_count::addr();
+    if(!substList.empty()){std::vector<uint64_t> pcs;for(auto& en:substList)pcs.push_back(en.pc);subst_count::setEntries(pcs);}
+    else if(substN){subst_count::setEntries({substPC});}
+    if(!substList.empty()){
+        // x13 = guest address of the instruction being decoded. For each entry: inside
+        // [pc, pc+n) and all n guest bytes equal ORIG -> decode from NEW at the same offset.
+        // A mismatching entry falls through to the next one; no entry -> stock decode.
+        ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("lnosubst",2,COND_NE);
+        ins(ldr_x_offset(10,12,kDecoderCtxCodeBase));ins(ldr_x_offset(11,12,kDecoderCtxCodeEnd));
+        ins(ldr_w_offset(9,SP,8));ins(add_reg_x(13,10,9));
+        for(size_t i=0;i<substList.size();i++){
+            const auto& en=substList[i]; const size_t n=en.orig.size();
+            const std::string nx="lnext"+std::to_string(i),lp="lcmp"+std::to_string(i);
+            constant(14,en.pc);ins(cmp_reg_x(13,14));branch(nx.c_str(),2,COND_LO);
+            constant(14,en.pc+n);ins(cmp_reg_x(13,14));branch(nx.c_str(),2,COND_HS);
+            ins(movz(15,0,0));
+            label(lp.c_str());
+            constant(16,en.pc);ins(add_reg_x(16,16,15));ins(ldrb_w_offset(9,16,0));
+            constant(16,listOrigAddr[i]);ins(add_reg_x(16,16,15));ins(ldrb_w_offset(17,16,0));
+            ins(cmp_reg_w(9,17));branch(nx.c_str(),2,COND_NE);
+            ins(add_imm(15,15,1));ins(cmp_imm_w(15,static_cast<unsigned>(n)));branch(lp.c_str(),2,COND_NE);
+            if(cnt){constant(17,cnt+8*i);ins(movz(9,1,0));ins(0xF829023FU);}   // stadd x9,[x17]: entry i applied
+            constant(14,en.pc);constant(15,listNewAddr[i]);constant(16,listNewAddr[i]+n);branch("lapply",0);
+            label(nx.c_str());
+        }
+        branch("lnosubst",0);
+        label("lapply");   // x13 insn, x14 entry pc, x15 entry NEW, x16 end of NEW
+        ins(sub_reg_x(14,13,14));ins(add_reg_x(15,15,14));
+        ins(str_x_offset(10,SP,40));ins(str_x_offset(11,SP,48));ins(str_x_offset(13,SP,56));ins(str_x_offset(15,SP,64));
+        ins(str_x_offset(15,12,kDecoderCtxCodeBase));ins(str_x_offset(16,12,kDecoderCtxCodeEnd));
+        ins(ldr_x_offset(0,SP,0));ins(movz(1,0,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);
+        ins(ldr_x_offset(12,SP,0));ins(ldp_offset(10,11,SP,40));
+        ins(str_x_offset(10,12,kDecoderCtxCodeBase));ins(str_x_offset(11,12,kDecoderCtxCodeEnd));
+        ins(ldr_x_offset(13,SP,56));
+        ins(cmp_imm_w(0,0));branch("done",2,COND_NE);
+        ins(str_x_offset(13,12,kDecoderCtxInsnStart));
+        ins(ldr_x_offset(15,SP,64));
+        ins(ldr_x_offset(9,12,kDecoderCtxCursor));ins(sub_reg_x(9,9,15));ins(add_reg_x(9,9,13));ins(str_x_offset(9,12,kDecoderCtxCursor));
+        branch("done",0);
+        label("lnosubst");
+        ins(ldp_offset(0,1,SP,0));ins(ldp_offset(2,3,SP,16));
+    }
+    if(substN){
+        ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("nosubst",2,COND_NE);
+        ins(ldr_x_offset(10,12,kDecoderCtxCodeBase));ins(ldr_x_offset(11,12,kDecoderCtxCodeEnd));
+        ins(ldr_w_offset(9,SP,8));ins(add_reg_x(13,10,9));
+        constant(14,substPC);ins(cmp_reg_x(13,14));branch("nosubst",2,COND_LO);
+        constant(14,substPC+substN);ins(cmp_reg_x(13,14));branch("nosubst",2,COND_HS);
+        ins(movz(15,0,0));
+        label("substcmp");
+        constant(16,substPC);ins(add_reg_x(16,16,15));ins(ldrb_w_offset(9,16,0));
+        constant(16,substOrigAddr);ins(add_reg_x(16,16,15));ins(ldrb_w_offset(17,16,0));
+        ins(cmp_reg_w(9,17));branch("nosubst",2,COND_NE);
+        ins(add_imm(15,15,1));ins(cmp_imm_w(15,static_cast<unsigned>(substN)));branch("substcmp",2,COND_NE);
+        if(cnt){constant(17,cnt);ins(movz(9,1,0));ins(0xF829023FU);}   // stadd x9,[x17]: the single entry applied
+        constant(14,substPC);ins(sub_reg_x(14,13,14));constant(15,substNewAddr);ins(add_reg_x(15,15,14));
+        ins(str_x_offset(10,SP,40));ins(str_x_offset(11,SP,48));ins(str_x_offset(13,SP,56));
+        ins(str_x_offset(15,12,kDecoderCtxCodeBase));constant(9,substNewAddr+substN);ins(str_x_offset(9,12,kDecoderCtxCodeEnd));
+        ins(ldr_x_offset(0,SP,0));ins(movz(1,0,0));ins(ldp_offset(2,3,SP,16));branch("stock",1);
+        ins(ldr_x_offset(12,SP,0));ins(ldp_offset(10,11,SP,40));
+        ins(str_x_offset(10,12,kDecoderCtxCodeBase));ins(str_x_offset(11,12,kDecoderCtxCodeEnd));
+        ins(ldr_x_offset(13,SP,56));
+        ins(cmp_imm_w(0,0));branch("done",2,COND_NE);
+        ins(str_x_offset(13,12,kDecoderCtxInsnStart));
+        constant(14,substPC);ins(sub_reg_x(14,13,14));constant(15,substNewAddr);ins(add_reg_x(15,15,14));
+        ins(ldr_x_offset(9,12,kDecoderCtxCursor));ins(sub_reg_x(9,9,15));ins(add_reg_x(9,9,13));ins(str_x_offset(9,12,kDecoderCtxCursor));
+        branch("done",0);
+        label("nosubst");
+        ins(ldp_offset(0,1,SP,0));ins(ldp_offset(2,3,SP,16));
+    }
+    if(!softFault){
+        // No substitution applied: drop our frame (x0..x3 are already restored) and continue in the default handler.
+        ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));branch("dflt",0);
+        label("done");ins(ldr_x_offset(LR,SP,32));ins(add_imm(SP,SP,96));ins(RET_INSN);
+        label("stock");h.insert(h.end(),orig,orig+16);emit_abs_jump_3movs(h,decodeOpcodeAddr+16);
+        while(h.size()%4)h.push_back(0);
+        label("dflt");
+        for(const auto& f:fixes){const int offset=static_cast<int>((static_cast<int64_t>(labels.at(f.label))-static_cast<int64_t>(f.pos))/4);patch_word(h,f.pos,f.kind==1?bl(offset):f.kind==0?b_uncond(offset):b_cond(f.cond,offset));}
+        const StubBlobs d=buildDefaultDecodeHook(handlerAddr+h.size(),decodeOpcodeAddr,orig,hostArplOpcode);
+        if(d.entry.size()!=16||d.handler.empty())return {};
+        h.insert(h.end(),d.handler.begin(),d.handler.end());
+        emit_abs_jump_3movs(b.entry,handlerAddr);return b;
+    }
     branch("stock",1);
     ins(cmp_imm_w(0,1));branch("done",2,COND_NE);
     ins(ldr_x_offset(12,SP,0));ins(ldrb_w_offset(9,12,0));ins(cmp_imm_w(9,0));branch("done",2,COND_NE);
@@ -1115,6 +1281,16 @@ StubBlobs buildDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
         if(softEnd||softOne){if(!softEnd||!softOne)return {};char *a=nullptr,*b=nullptr;end=std::strtoull(softEnd,&a,0);one=std::strtoull(softOne,&b,0);if(!end||!one||*a||*b)return {};}
         return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,pc,target,end,one);
     }
+    // Translation-time substitution works on its own: with AOE_SUBST_LIST (or all of AOE_SUBST_PC/ORIG/NEW) and no
+    // soft-fault variables, the substitution block runs in front of the default hook.
+    const char* sl=std::getenv("AOE_SUBST_LIST");
+    if((sl&&*sl)||(std::getenv("AOE_SUBST_PC")&&std::getenv("AOE_SUBST_ORIG")&&std::getenv("AOE_SUBST_NEW")))
+        return buildSoftFaultHook(handlerAddr,decodeOpcodeAddr,origPrologue16,0,0,0,0,false,hostArplOpcode);
+    return buildDefaultDecodeHook(handlerAddr,decodeOpcodeAddr,origPrologue16,hostArplOpcode);
+}
+
+static StubBlobs buildDefaultDecodeHook(uint64_t handlerAddr, uint64_t decodeOpcodeAddr,
+                                        const uint8_t origPrologue16[16], uint16_t hostArplOpcode) {
     StubBlobs blobs;
 
     // The 3-mov+br abs-jump encoding only works while the top 16 bits are zero.
